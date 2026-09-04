@@ -7,29 +7,34 @@ from unittest.mock import patch
 
 sys.modules.setdefault("svgwrite", types.SimpleNamespace(Drawing=object))
 
-from main import (
-    APPOINTEE_LINE_STROKE_COLOR,
-    APPOINTEE_LINE_STROKE_WIDTH,
+from batching import build_lineage_batches, get_batch_filename
+from drawing import (
+    draw_appointee_lines,
+    draw_lineage,
+    get_fill_color,
+    get_stroke_color,
+    wrap_name,
+)
+from layout import build_rings, calculate_positions
+from lineage_data import (
+    LineageDataError,
+    UnresolvedAppointeeWarning,
+    load_masons,
+    parse_appointee_names,
+    parse_year,
+)
+from models import Lineage, Mason
+from settings import (
+    APPOINTEE_LINE_COLOR,
+    APPOINTEE_LINE_WIDTH,
     BATCH_OVERLAP_RINGS,
     BATCH_SIZE,
     DRAWING_BACKGROUND_COLOR,
     MEMBERS_PER_RING,
+    MASTER_STROKE_COLOR,
     PAST_MASTER_FILL_COLOR,
-    PAST_MASTER_CIRCLE_STROKE_COLOR,
-    RETURNING_MASTER_LINE_STROKE_WIDTH,
+    CONSECUTIVE_TERM_LINE_WIDTH,
     RETURNING_MASTER_FILL_COLOR,
-    Lineage,
-    Mason,
-    build_lineage_batches,
-    get_batch_filename,
-    load_masons,
-    wrap_name,
-)
-from lineage_data import (
-    LineageDataError,
-    UnresolvedAppointeeWarning,
-    parse_appointee_names,
-    parse_year,
 )
 
 
@@ -40,6 +45,7 @@ class FakeDrawing:
         self.lines = []
         self.circles = []
         self.rectangles = []
+        self.paths = []
 
     def add(self, element):
         self.elements.append(element)
@@ -55,6 +61,10 @@ class FakeDrawing:
     def circle(self, **attributes):
         self.circles.append(attributes)
         return "<circle />"
+
+    def path(self, **attributes):
+        self.paths.append(attributes)
+        return "<path />"
 
     def text(self, text, **attributes):
         return f"<text>{text}</text>"
@@ -190,12 +200,12 @@ class LineageLayoutTests(unittest.TestCase):
     def test_officer_ring_has_six_slots(self):
         lineage = load_masons([["Officer One", ""], ["Officer Two", ""]])
 
-        lineage.parse_rings()
+        rings = build_rings(lineage)
 
-        self.assertEqual(len(lineage.rings), 1)
-        self.assertEqual(len(lineage.rings[0]), MEMBERS_PER_RING)
-        self.assertEqual(lineage.rings[0][0][0].name, "Officer One")
-        self.assertEqual(lineage.rings[0][1][0].name, "Officer Two")
+        self.assertEqual(len(rings), 1)
+        self.assertEqual(len(rings[0]), MEMBERS_PER_RING)
+        self.assertEqual(rings[0][0][0].name, "Officer One")
+        self.assertEqual(rings[0][1][0].name, "Officer Two")
 
     def test_master_years_are_grouped_into_service_rings(self):
         lineage = load_masons(
@@ -206,11 +216,11 @@ class LineageLayoutTests(unittest.TestCase):
             ]
         )
 
-        lineage.parse_rings()
+        rings = build_rings(lineage)
 
-        self.assertEqual(len(lineage.rings), 3)
-        self.assertIn(lineage.masons[2], lineage.rings[1][0])
-        self.assertIn(lineage.masons[1], lineage.rings[2][2])
+        self.assertEqual(len(rings), 3)
+        self.assertIn(lineage.masons[2], rings[1][0])
+        self.assertIn(lineage.masons[1], rings[2][2])
 
     def test_calculates_a_position_for_every_mason(self):
         lineage = load_masons(
@@ -221,7 +231,7 @@ class LineageLayoutTests(unittest.TestCase):
             ]
         )
 
-        positions = lineage.calculate_positions()
+        positions = calculate_positions(lineage)
 
         self.assertCountEqual(
             [mason for mason, _, _ in positions],
@@ -234,16 +244,16 @@ class MasonColorTests(unittest.TestCase):
         lineage = load_masons([["Officer", ""]])
 
         self.assertEqual(
-            lineage.masons[0].get_stroke_color(),
-            APPOINTEE_LINE_STROKE_COLOR,
+            get_stroke_color(lineage.masons[0]),
+            APPOINTEE_LINE_COLOR,
         )
 
     def test_past_masters_have_gold_strokes(self):
         lineage = load_masons([["Past Master", "2024"]])
 
         self.assertEqual(
-            lineage.masons[0].get_stroke_color(),
-            PAST_MASTER_CIRCLE_STROKE_COLOR,
+            get_stroke_color(lineage.masons[0]),
+            MASTER_STROKE_COLOR,
         )
 
     def test_returning_masters_have_gold_strokes(self):
@@ -255,8 +265,8 @@ class MasonColorTests(unittest.TestCase):
         )
 
         self.assertEqual(
-            lineage.masons[1].get_stroke_color(),
-            PAST_MASTER_CIRCLE_STROKE_COLOR,
+            get_stroke_color(lineage.masons[1]),
+            MASTER_STROKE_COLOR,
         )
 
     def test_consecutive_returning_terms_are_light_blue(self):
@@ -267,9 +277,9 @@ class MasonColorTests(unittest.TestCase):
             ]
         )
 
-        self.assertEqual(lineage.masons[0].get_fill_color(), PAST_MASTER_FILL_COLOR)
+        self.assertEqual(get_fill_color(lineage.masons[0]), PAST_MASTER_FILL_COLOR)
         self.assertEqual(
-            lineage.masons[1].get_fill_color(),
+            get_fill_color(lineage.masons[1]),
             RETURNING_MASTER_FILL_COLOR,
         )
 
@@ -281,9 +291,9 @@ class MasonColorTests(unittest.TestCase):
             ]
         )
 
-        self.assertEqual(lineage.masons[0].get_fill_color(), PAST_MASTER_FILL_COLOR)
+        self.assertEqual(get_fill_color(lineage.masons[0]), PAST_MASTER_FILL_COLOR)
         self.assertEqual(
-            lineage.masons[1].get_fill_color(),
+            get_fill_color(lineage.masons[1]),
             RETURNING_MASTER_FILL_COLOR,
         )
 
@@ -293,61 +303,124 @@ class ConsecutiveTermConnectionTests(unittest.TestCase):
         lineage = load_masons(rows)
         with tempfile.TemporaryDirectory() as temporary_directory:
             filename = Path(temporary_directory) / "lineage.svg"
-            with patch("main.svgwrite.Drawing", FakeDrawing):
-                lineage.draw(str(filename))
-        return lineage
+            with patch("drawing.svgwrite.Drawing", FakeDrawing):
+                drawing = draw_lineage(lineage, str(filename))
+        return drawing
 
     def test_connects_consecutive_terms_with_a_thick_gold_line(self):
-        lineage = self.draw_lineage(
+        drawing = self.draw_lineage(
             [
                 ["Returning Master", "2023"],
                 ["Returning Master", "2024"],
             ]
         )
 
-        self.assertEqual(len(lineage.drawing.lines), 1)
+        self.assertEqual(len(drawing.lines), 1)
         self.assertEqual(
-            lineage.drawing.lines[0]["stroke"],
-            PAST_MASTER_CIRCLE_STROKE_COLOR,
+            drawing.lines[0]["stroke"],
+            MASTER_STROKE_COLOR,
         )
         self.assertEqual(
-            lineage.drawing.lines[0]["stroke_width"],
-            RETURNING_MASTER_LINE_STROKE_WIDTH,
+            drawing.lines[0]["stroke_width"],
+            CONSECUTIVE_TERM_LINE_WIDTH,
         )
 
     def test_does_not_connect_non_consecutive_terms(self):
-        lineage = self.draw_lineage(
+        drawing = self.draw_lineage(
             [
                 ["Returning Master", "2020"],
                 ["Returning Master", "2024"],
             ]
         )
 
-        self.assertEqual(lineage.drawing.lines, [])
+        self.assertEqual(drawing.lines, [])
 
 
 class AppointeeConnectionTests(unittest.TestCase):
-    def test_connects_appointees_with_a_light_gray_line(self):
-        lineage = load_masons(
+    def make_lineage(self):
+        return load_masons(
             [
                 ["Officer", ""],
                 ["Past Master", "2024", "Officer"],
             ]
         )
 
+    def test_keeps_short_appointee_connections_straight(self):
+        lineage = self.make_lineage()
+
         with tempfile.TemporaryDirectory() as temporary_directory:
             filename = Path(temporary_directory) / "lineage.svg"
-            with patch("main.svgwrite.Drawing", FakeDrawing):
-                lineage.draw(str(filename))
+            with patch("drawing.svgwrite.Drawing", FakeDrawing):
+                drawing = draw_lineage(lineage, str(filename))
 
-        self.assertEqual(len(lineage.drawing.lines), 1)
+        self.assertEqual(len(drawing.lines), 1)
+        self.assertEqual(drawing.paths, [])
+        self.assertEqual(drawing.lines[0]["stroke"], APPOINTEE_LINE_COLOR)
+        self.assertEqual(drawing.lines[0]["stroke_width"], APPOINTEE_LINE_WIDTH)
+
+    def test_curves_long_appointee_connections(self):
+        lineage = self.make_lineage()
+        officer, past_master = lineage.masons
+        drawing = FakeDrawing("unused.svg")
+        coordinates = {
+            officer: (0, 0),
+            past_master: (500, 0),
+        }
+
+        draw_appointee_lines(drawing, lineage, coordinates)
+
+        self.assertEqual(drawing.lines, [])
+        self.assertEqual(len(drawing.paths), 1)
+        self.assertIn(" Q ", drawing.paths[0]["d"])
+        self.assertIn("Q 250.0,80.0", drawing.paths[0]["d"])
+
+    def test_curve_direction_follows_the_spiral_setting(self):
+        lineage = self.make_lineage()
+        officer, past_master = lineage.masons
+        drawing = FakeDrawing("unused.svg")
+        coordinates = {
+            officer: (0, 0),
+            past_master: (500, 0),
+        }
+
+        with patch("drawing.SPIRAL_DIRECTION", 1):
+            draw_appointee_lines(drawing, lineage, coordinates)
+
+        self.assertIn("Q 250.0,-80.0", drawing.paths[0]["d"])
+
+    def test_can_restore_straight_appointee_lines_with_one_setting(self):
+        lineage = self.make_lineage()
+        officer, past_master = lineage.masons
+        drawing = FakeDrawing("unused.svg")
+        coordinates = {
+            officer: (0, 0),
+            past_master: (500, 0),
+        }
+
+        with patch("drawing.CURVE_APPOINTEE_LINES", False):
+            draw_appointee_lines(drawing, lineage, coordinates)
+
+        self.assertEqual(len(drawing.lines), 1)
+        self.assertEqual(drawing.paths, [])
+
+    def test_uses_the_same_style_for_curved_connections(self):
+        lineage = self.make_lineage()
+        officer, past_master = lineage.masons
+        drawing = FakeDrawing("unused.svg")
+        draw_appointee_lines(
+            drawing,
+            lineage,
+            {officer: (0, 0), past_master: (500, 0)},
+        )
+
+        self.assertEqual(len(drawing.paths), 1)
         self.assertEqual(
-            lineage.drawing.lines[0]["stroke"],
-            APPOINTEE_LINE_STROKE_COLOR,
+            drawing.paths[0]["stroke"],
+            APPOINTEE_LINE_COLOR,
         )
         self.assertEqual(
-            lineage.drawing.lines[0]["stroke_width"],
-            APPOINTEE_LINE_STROKE_WIDTH,
+            drawing.paths[0]["stroke_width"],
+            APPOINTEE_LINE_WIDTH,
         )
 
 class LineageBatchTests(unittest.TestCase):
@@ -411,9 +484,9 @@ class LineageBatchTests(unittest.TestCase):
         batches = build_lineage_batches(self.make_lineage(65))
 
         for batch in batches:
-            batch.parse_rings()
+            rings = build_rings(batch)
+            self.assertLessEqual(len(rings), 5)
 
-        self.assertTrue(all(len(batch.rings) <= 5 for batch in batches))
 
     def test_batches_start_with_the_oldest_years(self):
         batches = build_lineage_batches(self.make_lineage(31))
@@ -438,11 +511,11 @@ class LineageBatchTests(unittest.TestCase):
 
         overall_positions = {
             (mason.name, mason.year_as_master): (x, y)
-            for mason, x, y in lineage.calculate_positions()
+            for mason, x, y in calculate_positions(lineage)
         }
         batch_positions = {
             (mason.name, mason.year_as_master): (x, y)
-            for mason, x, y in latest_batch.calculate_positions()
+            for mason, x, y in calculate_positions(latest_batch)
         }
 
         for mason_key, position in batch_positions.items():
@@ -460,19 +533,19 @@ class LineageBatchTests(unittest.TestCase):
 class SvgDrawingTests(unittest.TestCase):
     def test_draws_an_svg_file(self):
         lineage = Lineage()
-        lineage.add(Mason("Joe Shoulak", "2024"))
+        lineage.add(Mason("Joe Shoulak", 2024))
 
         with tempfile.TemporaryDirectory() as temporary_directory:
             filename = Path(temporary_directory) / "lineage.svg"
-            with patch("main.svgwrite.Drawing", FakeDrawing):
-                lineage.draw(str(filename))
+            with patch("drawing.svgwrite.Drawing", FakeDrawing):
+                drawing = draw_lineage(lineage, str(filename))
 
             svg = filename.read_text(encoding="utf-8")
 
         self.assertIn("<svg", svg)
         self.assertIn("Joe Shoulak", svg)
         self.assertEqual(
-            lineage.drawing.rectangles[0]["fill"],
+            drawing.rectangles[0]["fill"],
             DRAWING_BACKGROUND_COLOR,
         )
 

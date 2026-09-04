@@ -45,3 +45,13 @@ The script stops before drawing if a row has a missing name, missing column, inv
 ```bash
 python -m unittest -v
 ```
+
+## Project structure
+
+- `main.py` chooses whether to generate the overall lineage, batches, or both.
+- `lineage_data.py` validates and loads the published spreadsheet.
+- `models.py` contains the `Lineage` and `Mason` data objects.
+- `batching.py` divides the lineage into overlapping batches.
+- `layout.py` builds rings and calculates circle positions.
+- `drawing.py` writes positions, connections, circles, and labels to SVG.
+- `settings.py` contains filenames, sizes, colors, and batch options.
