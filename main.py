@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import math
 import sys
+import warnings
 from collections.abc import Iterable
 from io import TextIOWrapper
 from pathlib import Path
@@ -10,13 +11,21 @@ from urllib.request import urlopen
 
 import svgwrite
 
+from lineage_data import (
+    UnresolvedAppointeeWarning,
+    parse_year,
+    validate_mason_rows,
+)
+
 LINK = "https://docs.google.com/spreadsheets/d/e/2PACX-1vRzUnSMbwWOyKb83-Ww6dhZR7P1849YEub-HegsdPOocTHKGbfpfx2OIMx5HiECricVZYhPzDWZ2Crk/pub?output=csv"
 FILENAME = "Lineage.svg"
 BATCH_DIRECTORY = "Lineage_batches"
 BATCH_SIZE = 30
+BATCH_OVERLAP_RINGS = 1
 STARTING_MEMBER = "Darren Swenson"
 CIRCLE_SIZE = 50
 DRAWING_PADDING = 40
+DRAWING_BACKGROUND_COLOR = "#111827"
 MEMBERS_PER_RING = 6
 FIRST_RING_RADIUS = 150
 RING_SPACING = 140
@@ -24,7 +33,7 @@ CIRCLE_GAP = 20
 OFFICER_FILL_COLOR = "#94a3b8"
 RETURNING_MASTER_FILL_COLOR = "#3b82f6"
 PAST_MASTER_FILL_COLOR = "#1e40af"
-CIRCLE_STROKE_COLOR = "#1e3a8a"
+PAST_MASTER_CIRCLE_STROKE_COLOR = "#d4af37"
 CIRCLE_STROKE_WIDTH = 3
 FONT_COLOR = "white"
 FONT_SIZE = "12px"
@@ -34,33 +43,9 @@ NAME_MAX_CHARACTERS_PER_LINE = 12
 NAME_LINE_HEIGHT = 14
 YEAR_FONT_SIZE = "10px"
 YEAR_LINE_HEIGHT = 12
-LINE_STROKE_COLOR = "#374151"
-LINE_STROKE_WIDTH = 4
-
-
-def parse_years(year_text: str) -> set[int]:
-    normalized_year = year_text.replace("–", "-").replace("—", "-").strip()
-    if not normalized_year:
-        return set()
-
-    try:
-        endpoints = [int(year.strip()) for year in normalized_year.split("-", 1)]
-    except ValueError:
-        return set()
-
-    first_year = min(endpoints)
-    last_year = max(endpoints)
-    return set(range(first_year, last_year + 1))
-
-
-def parse_appointee_names(appointee_cells: list[str]) -> list[str]:
-    """Return individual names from comma-separated appointee cells."""
-    return [
-        name.strip()
-        for cell in appointee_cells
-        for name in cell.split(",")
-        if name.strip()
-    ]
+APPOINTEE_LINE_STROKE_COLOR = "#d1d5db"
+APPOINTEE_LINE_STROKE_WIDTH = 4
+RETURNING_MASTER_LINE_STROKE_WIDTH = 10
 
 
 def wrap_name(name: str) -> list[str]:
@@ -99,62 +84,32 @@ class Lineage:
             self.rings.append(ring)
 
     def get_service_years(self, masters: list[Mason]) -> list[int]:
-        newest_year = max(year for mason in masters for year in mason.years_as_master)
-        oldest_year = min(year for mason in masters for year in mason.years_as_master)
+        newest_year = max(mason.year for mason in masters if mason.year is not None)
+        oldest_year = min(mason.year for mason in masters if mason.year is not None)
         service_year_count = newest_year - oldest_year + 1
         service_ring_count = math.ceil(service_year_count / MEMBERS_PER_RING)
         return list(
             range(newest_year, newest_year - service_ring_count * MEMBERS_PER_RING, -1)
         )
 
-    def choose_master_rings(
-        self,
-        masters: list[Mason],
-        year_to_ring: dict[int, int],
-    ) -> dict[Mason, int]:
-        chosen_rings = {}
-        for mason in masters:
-            years_per_ring = {}
-            for year in mason.years_as_master:
-                ring_index = year_to_ring[year]
-                years_per_ring[ring_index] = years_per_ring.get(ring_index, 0) + 1
-
-            chosen_rings[mason] = min(
-                years_per_ring,
-                key=lambda ring_index: (-years_per_ring[ring_index], ring_index),
-            )
-        return chosen_rings
-
     def add_master_rings(self, masters: list[Mason]):
         service_years = self.get_service_years(masters)
-        officer_ring_count = len(self.rings)
-        year_to_ring = {
-            year: officer_ring_count + index // MEMBERS_PER_RING
-            for index, year in enumerate(service_years)
-        }
-        chosen_rings = self.choose_master_rings(masters, year_to_ring)
 
         for year_index in range(0, len(service_years), MEMBERS_PER_RING):
-            ring_index = officer_ring_count + year_index // MEMBERS_PER_RING
             ring = []
 
             for year in service_years[year_index:year_index + MEMBERS_PER_RING]:
                 masters_that_year = [
-                    mason for mason in masters if year in mason.years_as_master
+                    mason for mason in masters if mason.year == year
                 ]
-                masters_in_this_ring = [
-                    mason
-                    for mason in masters_that_year
-                    if chosen_rings[mason] == ring_index
-                ]
-                ring.append(masters_in_this_ring)
+                ring.append(masters_that_year)
 
             self.rings.append(ring)
 
     def parse_rings(self):
         self.rings = []
-        officers = [mason for mason in self.masons if not mason.years_as_master]
-        masters = [mason for mason in self.masons if mason.years_as_master]
+        officers = [mason for mason in self.masons if mason.year is None]
+        masters = [mason for mason in self.masons if mason.year is not None]
 
         self.add_officer_rings(officers)
         if masters:
@@ -237,7 +192,7 @@ class Lineage:
                 for group_index, mason in enumerate(grouped_masons):
                     offset = group_index - (len(grouped_masons) - 1) / 2
                     # A small cumulative turn creates six readable spiral arms.
-                    ring_rotation = ring_index * slot_angle / 6
+                    ring_rotation = -ring_index * slot_angle / 6
                     angle = (
                         starting_angle
                         + ring_rotation
@@ -287,12 +242,14 @@ class Lineage:
             self.drawing.rect(
                 insert=(0, 0),
                 size=("100%", "100%"),
-                fill="white",
+                fill=DRAWING_BACKGROUND_COLOR,
             )
         )
 
         for mason, _, _ in positions:
-            mason.draw_connections()
+            mason.draw_appointee_connections()
+        for mason, _, _ in positions:
+            mason.draw_consecutive_term_connection()
         for mason, _, _ in positions:
             mason.draw()
 
@@ -309,7 +266,7 @@ class Mason:
     ) -> None:
         self.name = name
         self.year_as_master = year_as_master
-        self.years_as_master = parse_years(year_as_master)
+        self.year = parse_year(year_as_master)
         self.is_returning_master = False
         self.appointees = appointees or []
         self.x: float | None = None
@@ -322,43 +279,80 @@ class Mason:
         return self.lineage.drawing
 
     def get_fill_color(self) -> str:
-        if not self.years_as_master:
+        if self.year is None:
             return OFFICER_FILL_COLOR
 
         if self.is_returning_master:
             return RETURNING_MASTER_FILL_COLOR
         return PAST_MASTER_FILL_COLOR
 
-    def draw_connections(self) -> None:
+    def get_stroke_color(self) -> str:
+        if self.year is None:
+            return APPOINTEE_LINE_STROKE_COLOR
+        return PAST_MASTER_CIRCLE_STROKE_COLOR
+
+    def draw_line_to(self, mason: Mason, color: str, width: int) -> None:
         drawing = self.get_drawing()
         assert self.x is not None and self.y is not None
+        assert mason.x is not None and mason.y is not None
+
+        delta_x = mason.x - self.x
+        delta_y = mason.y - self.y
+        distance = math.hypot(delta_x, delta_y)
+        if distance == 0:
+            return
+
+        unit_x = delta_x / distance
+        unit_y = delta_y / distance
+        drawing.add(
+            drawing.line(
+                start=(
+                    self.x + unit_x * CIRCLE_SIZE,
+                    self.y + unit_y * CIRCLE_SIZE,
+                ),
+                end=(
+                    mason.x - unit_x * CIRCLE_SIZE,
+                    mason.y - unit_y * CIRCLE_SIZE,
+                ),
+                stroke=color,
+                stroke_width=width,
+            )
+        )
+
+    def draw_appointee_connections(self) -> None:
+        assert self.lineage is not None
 
         for appointee in self.appointees:
             if appointee not in self.lineage.masons:
                 continue
-            assert appointee.x is not None and appointee.y is not None
-            delta_x = appointee.x - self.x
-            delta_y = appointee.y - self.y
-            distance = math.hypot(delta_x, delta_y)
-            if distance == 0:
-                continue
-
-            unit_x = delta_x / distance
-            unit_y = delta_y / distance
-            drawing.add(
-                drawing.line(
-                    start=(
-                        self.x + unit_x * CIRCLE_SIZE,
-                        self.y + unit_y * CIRCLE_SIZE,
-                    ),
-                    end=(
-                        appointee.x - unit_x * CIRCLE_SIZE,
-                        appointee.y - unit_y * CIRCLE_SIZE,
-                    ),
-                    stroke=LINE_STROKE_COLOR,
-                    stroke_width=LINE_STROKE_WIDTH,
-                )
+            self.draw_line_to(
+                appointee,
+                APPOINTEE_LINE_STROKE_COLOR,
+                APPOINTEE_LINE_STROKE_WIDTH,
             )
+
+    def draw_consecutive_term_connection(self) -> None:
+        if self.year is None:
+            return
+
+        assert self.lineage is not None
+        previous_term = next(
+            (
+                mason
+                for mason in self.lineage.masons
+                if mason.name == self.name
+                and mason.year == self.year - 1
+            ),
+            None,
+        )
+        if previous_term is None:
+            return
+
+        self.draw_line_to(
+            previous_term,
+            PAST_MASTER_CIRCLE_STROKE_COLOR,
+            RETURNING_MASTER_LINE_STROKE_WIDTH,
+        )
 
     def draw_label(self) -> None:
         drawing = self.get_drawing()
@@ -406,7 +400,7 @@ class Mason:
                 center=(self.x, self.y),
                 r=CIRCLE_SIZE,
                 fill=self.get_fill_color(),
-                stroke=CIRCLE_STROKE_COLOR,
+                stroke=self.get_stroke_color(),
                 stroke_width=CIRCLE_STROKE_WIDTH,
             )
         )
@@ -417,27 +411,33 @@ def load_masons(rows: Iterable[list[str]]) -> Lineage:
     lineage = Lineage()
     appointee_names_by_mason = []
 
-    for row in rows:
-        if not row or not row[0].strip():
-            continue
-
-        name = row[0].strip()
-        year_as_master = row[1].strip() if len(row) > 1 else ""
-        mason = Mason(name, year_as_master)
+    for mason_row in validate_mason_rows(rows):
+        mason = Mason(mason_row.name, mason_row.year_text)
         lineage.add(mason)
-        appointee_names_by_mason.append((mason, parse_appointee_names(row[2:])))
+        appointee_names_by_mason.append((mason, mason_row))
 
-    for mason, appointee_names in appointee_names_by_mason:
+    known_names = {mason.name for mason in lineage.masons}
+    for mason, mason_row in appointee_names_by_mason:
+        missing_names = [
+            name for name in mason_row.appointee_names if name not in known_names
+        ]
+        for missing_name in missing_names:
+            warnings.warn(
+                f"Row {mason_row.row_number}: appointee {missing_name!r} "
+                "does not match any mason",
+                UnresolvedAppointeeWarning,
+            )
+
         mason.appointees = [
             appointee
             for appointee in lineage.masons
-            if appointee.name in appointee_names
+            if appointee.name in mason_row.appointee_names
         ]
 
     first_term_by_name = {}
     for mason in sorted(
-        (mason for mason in lineage.masons if mason.years_as_master),
-        key=lambda mason: min(mason.years_as_master),
+        (mason for mason in lineage.masons if mason.year is not None),
+        key=lambda mason: mason.year,
     ):
         mason.is_returning_master = mason.name in first_term_by_name
         first_term_by_name.setdefault(mason.name, mason)
@@ -449,7 +449,12 @@ def load_lineage(link: str = LINK) -> Lineage:
     with urlopen(link) as response:
         mason_data = csv.reader(TextIOWrapper(response, encoding="utf-8"))
         next(mason_data, None)
-        return load_masons(mason_data)
+        lineage = load_masons(mason_data)
+
+    master_count = len([mason for mason in lineage.masons if mason.year is not None])
+    officer_count = len(lineage.masons) - master_count
+    print(f"Loaded {master_count} masters and {officer_count} officers")
+    return lineage
 
 
 def clone_lineage(masons: list[Mason]) -> Lineage:
@@ -473,14 +478,19 @@ def clone_lineage(masons: list[Mason]) -> Lineage:
 
 
 def build_lineage_batches(lineage: Lineage) -> list[Lineage]:
-    officers = [mason for mason in lineage.masons if not mason.years_as_master]
+    officers = [mason for mason in lineage.masons if mason.year is None]
     masters = sorted(
-        (mason for mason in lineage.masons if mason.years_as_master),
-        key=lambda mason: min(mason.years_as_master),
+        (mason for mason in lineage.masons if mason.year is not None),
+        key=lambda mason: mason.year,
     )
     batches = []
+    overlap_size = BATCH_OVERLAP_RINGS * MEMBERS_PER_RING
+    batch_step = BATCH_SIZE - overlap_size
 
-    for index in range(0, len(masters), BATCH_SIZE):
+    if batch_step <= 0:
+        raise ValueError("Batch overlap must be smaller than the batch size")
+
+    for index in range(0, len(masters), batch_step):
         master_batch = masters[index:index + BATCH_SIZE]
         is_latest_batch = index + BATCH_SIZE >= len(masters)
         if is_latest_batch and len(master_batch) < BATCH_SIZE:
@@ -493,9 +503,9 @@ def build_lineage_batches(lineage: Lineage) -> list[Lineage]:
 
 def get_batch_filename(batch: Lineage, batch_number: int) -> str:
     years = [
-        year
+        mason.year
         for mason in batch.masons
-        for year in mason.years_as_master
+        if mason.year is not None
     ]
     oldest_year = min(years)
     newest_year = max(years)
@@ -512,6 +522,9 @@ def generate_lineage_batches() -> None:
     batches = build_lineage_batches(lineage)
     batch_directory = Path(BATCH_DIRECTORY)
     batch_directory.mkdir(exist_ok=True)
+
+    for old_batch_file in batch_directory.glob("Lineage_*.svg"):
+        old_batch_file.unlink()
 
     for batch_number, batch in enumerate(batches, start=1):
         filename = batch_directory / get_batch_filename(batch, batch_number)
